@@ -1,0 +1,398 @@
+---
+title: "Home Loans Analysis"
+author: "Duff Wang"
+date: "2/17/2017"
+output: html_document
+runtime: shiny
+resource_files:
+- 2012_to_2014_loans_data_cached.rds
+- 2012_to_2014_institutions_data_cached.rds
+---
+
+```{r header, include = FALSE}
+###INSTRUCTIONS### 
+#1. Install these packages if necessary
+#install.packages(c("data.table", "Hmisc", "reshape2", "ggplot2", "shiny", "jsonlite", "stringdist"))
+#2. Set the working directory to the folder containing the data files and the two csv data files
+#setwd("PATH")
+#3. Run the document
+```
+
+##Introduction
+This report will go over a quality check on our HMDA dataset.
+
+Next, the report will present some key analysis on the dataset, showing a trend in home loans from 2012-2014, exploring the reasons behind these trends, and coming to some conclusions on whether our firm should enter these markets.
+
+Finally, this report will present a unique tool meant to help explore the different demographic profiles of successful loan applicants during this time period.
+
+###Data Description
+The dataset is [publically available](https://www.ffiec.gov/hmda/hmdaflat.htm) and was generated in compliance with the Home Mortgage Disclosure Act of 1975, which requires disclosures on the originations and purchases of home purchase, improvement, and refinancing loans. The 2012-2014 data used in this report has been filtered to five states (MD, VA, WV, DC, DE) and to 1-4 family, owner-occupied home loans, with an originated action type, secured by a first or subordinate lien.
+
+
+
+```{r setup, include=FALSE}
+#Source HMDA analysis API and our shiny simulation tool
+source('HMDA_API.R')
+source('LoanSimulationShinyApp.R')
+
+#Parameters
+knitr::opts_chunk$set(echo = FALSE)   #Set this to TRUE to see analysis code in the report
+```
+
+```{r import}
+#Now, we import the raw data.
+#Read input data
+dt.loans <- hmda_init()
+```
+
+##Quality Check
+
+###Quality Check: Loan Amount
+First, we turn out attention to the loan amount column. We want to look for any spurious data points. The magnitude of loan amounts may vary for different properties, but they should not be drastically more than the median income of the applicant. We will look at each respondent and calculate their average loan to income ratio. 
+
+One notable outlier comes from **Megachange Financial**, a company that gave out loans with loan to median income ratios that were three orders of magnitude larger than any other lender, as shown in **Figure 1** with the outlier highlighted in red. The average loan to income ratio for this firm was around 1000, while the second highest was at only around 10. Megachange loans are in the range of tens of millions of dollars, with typical median income less than $100k.
+
+One possible explanation is that the firm incorrectly submitted the loan amounts in units of dollars instead of units of thousands of dollars, which is what the dataset uses for that field. This would explain the order of magnitude disprepancy being three. Another explanation is that these are atypical loans given for extremely high value properties, perhaps given to high net worth individuals. 
+
+As these loans account for less than **0.1%** of all loans in our dataset, are possibly the result of a mistake, and fail our sanity check, I have chosen to remove these outliers from our data set. 
+
+As a future quality check rule, I would implement a check for any respondent with an average loan to income **ratio greater than 20**. I chose this threshold because our dataset shows every other firm has such a ratio firmly below 20, and that threshold should capture any obvious outliers such as Megachange Mortgage.
+
+```{r outlier}
+setkey(dt.loans, applicant.income.usd, year, code.agency, id.respondent, sequence.number)
+
+#Find the highest loan / income ratios
+dt.loans <- dt.loans[,loan.income.ratio := loan.usd / applicant.income.usd]
+dt.loans <- dt.loans[applicant.income.usd == 0L, loan.income.ratio := NA_integer_]
+
+setkey(dt.loans, id.respondent, code.agency, year, sequence.number)
+dt.highest.loan.income.ratio <- dt.loans[!is.na(loan.income.ratio),list(loan.income.ratio.avg = mean(loan.income.ratio)), by = list(id.respondent, code.agency, respondent.name)]
+
+dt.highest.loan.income.ratio <- dt.highest.loan.income.ratio[order(loan.income.ratio.avg, decreasing = T)]
+dt.highest.loan.income.ratio <- dt.highest.loan.income.ratio[, respondent.name := factor(respondent.name, levels = unique(respondent.name))] #Reorder factor levels so stacked bar chart is ordered how we want
+
+
+#Show top 10 average loan to income ratios by respondent, which shows the outlier
+ggplot(data=dt.highest.loan.income.ratio[1:10], aes(x = respondent.name, y = loan.income.ratio.avg))+
+  geom_point() + 
+  labs(x = "Respondent",
+       y = "Average Loan to Median Income Ratio",
+       title = "Figure 1. Top Ten Average Loan to Median Income Ratios")+ theme(text = element_text(size=14), axis.text.x = element_text(angle=45, vjust = 1, hjust = 1))+ annotate("rect", xmin=0.6, xmax=1.4, ymin=-50, ymax= 1050, fill=NA, colour="red")
+
+#Remove outlier data point
+dt.loans <- dt.loans[code.agency != 9 | id.respondent != 9731400737]
+
+setkey(dt.loans, year, id.respondent, code.agency, sequence.number)
+```
+
+
+###Quality Check: Respondent Name
+
+Next, the respondent name field suffers from typos or slight formatting changes, causing a single respondent to be listed multiple times under different names.
+
+The best way to resolve this is to create a concept of "**respondent name anchors**". These respondent anchors correspond one to one with actual respondents. We will then proceed to try various strategies to "map" the respondent names provided to these unique respondent name anchors.
+
+One good way to do this is by measuring each respondent name's **Levenstein distance** with every other respondent name. A Levenstein distance assigns a penalty for each deletion, insertion, and substitution that is required to transform one string into another. We then use a cutoff Levenstein distance to form a map of respondent names that are very close to another respondent name. We'll assign double penalty to substitution as opposed to deletion or insertion, since most typos will be in the form of an extra space or comma, while entire character changes suggest they are different banks with similar names.
+
+One issue with this strategy is that many banks use abbreviations that could be only off by a letter. We will implement **another rule** that states if the first three letters of any two names are different, then they are different entities. This should remove most of these false positives while still keeping most of the truly needed mappings.
+
+The results of our mapping is shown in the table below. We found fixed **84** respondent names out of **1,602**. As you can see by scrolling through the table, our conservative mapping rules produced no false positives. Using the 'respondent name anchor' concept, we can continue to add new rules and build more filters to "map" respondent names. As it grows more complex, however, we will need more manual checking and failsafe logic, so we'll keep just the two simple rules described for now.
+
+In the future, I would use the rules implemented above, as well as **propose a mapping system** with looser criteria where the end user can manually choose to map new data, after being presented with a list of the closest Levenstein distance matches.
+
+
+```{r respondentname, fig.height = 4}
+#We will use a levenstein survey, with a higher penalty for substitutions, as those make it more likely it is two different banks with similar names.
+#We're mostly looking for deletion and insertion typos.
+chr.respondent.unique <- unique(dt.loans$respondent.name)
+mat.lv.distance <- stringdistmatrix(chr.respondent.unique, chr.respondent.unique, method = "lv", weight = c(0.5, 0.5, 1, 1))
+mat.lv.distance[mat.lv.distance == 0] = Inf #Exclude "from" strings from matching with themselves, as we want the next closest match
+int.lv.min <- apply(mat.lv.distance,2,function(x) return(array(min(x)))) #Get closest match for each respondent
+int.map.from <- which(int.lv.min <= 1) #This threshold allows 2 deletions/insertions, and 1 substitution
+int.map.to <- apply(mat.lv.distance[,int.map.from], 2, function(x) return(which.min(x))) #Retrieve which index to map to
+dt.map.name = data.table(from = seq_along(chr.respondent.unique), to = seq_along(chr.respondent.unique)) #Create a mapping table
+dt.map.name[int.map.from]$to = pmin(int.map.to, dt.map.name[int.map.from]$to) #We'll always soon the first respondent as our 'anchor' respondent we map to
+dt.map.name <- dt.map.name[,from_name := chr.respondent.unique[from]]
+dt.map.name <- dt.map.name[,to_name := chr.respondent.unique[to]]
+
+#Because many banks use abbreviations that are only a character off, let's filter out anything where the first three letters don't match
+invisible(dt.map.name[substring(from_name, 1, 3) != substring(to_name, 1, 3), to := from])
+setkey(dt.map.name, from_name)
+
+dt.loans <- merge(dt.loans, dt.map.name[,list(respondent.name = from_name, respondent.name.anchor = to_name)], by = "respondent.name")
+
+setkey(dt.loans, year, id.respondent, code.agency, sequence.number)
+```
+<div style="height:400px;overflow:auto">
+
+*This table shows only entries where a respondent name was mapped to a different anchor. All other entries were mapped to themselves.*
+
+```{r respondentmappingtable}
+#Show our mapping changes
+print(dt.map.name[from != to, list(`Original Name` = from_name, `Anchor Name` = to_name)])
+```
+</div>
+
+###Quality Check: Metropolitan Area
+The third column we'll do a quality check on is the metropolitan area. Firstly, everything is in uppercase, but we would prefer to get it in a normal mixed case format. Because the entries are in address format (e.g. **Richmond, VA**) we write a custom function to convert these names to mixed case.
+
+It would take a long time to run our function on every single row in the table, as the case changing function does not natively take advantage of R's 'vectorized' functionality. Instead, we'll create a **separate mapping table**, going from MSA/MD id to a cleaned up version of the name.
+
+An initial look at the metropolitan areas reveals many entries that are very similar, differing only by a city name or state, or in some different order. We could potentially employ the same strategy as for the respondent names, where we map together similar metropolitan areas. However, a look at the [FFIEC website](https://www.ffiec.gov/geocode/help1.aspx) reveals these **metropolitan areas are adjusted annually**. Since the boundaries are changing, we would not want to map these metropolitan areas together, as they wouldn't actually be the same entity. 
+
+We'll leave these as is, but I would discuss with the team if that if they end up using the metropolitan area data more and need a continuous history, we could potentially link together similar MSA/MD entities.
+
+```{r msamdcleanup} 
+#Create useful mapping table
+dt.map.msamd <- unique(dt.loans[,list(MSA.MD, MSA.MD.desc.old = MSA.MD.desc)])[!is.na(MSA.MD)] #msa/md id to description
+dt.map.msamd <- dt.map.msamd[,MSA.MD.desc := HmdaMixedCaseAddress(MSA.MD.desc.old)]
+setkey(dt.map.msamd, MSA.MD)
+```
+
+<div style="height:400px;overflow:auto">
+
+*Note: entries are trimmed to max 30 characters, for formatting purposes.*
+
+```{r msamdmdtable}
+#Show our mapping changes
+
+print(dt.map.msamd[, list(`Original Name` = strtrim(MSA.MD.desc.old, 30), `Mixed Case` = strtrim(MSA.MD.desc, 30))])
+```
+</div>
+
+
+##Data Narrative 20 Minute Presentation
+
+###Hypothesis
+Let's say we are a hypothetical firm that is trying to decide if we are going to enter the home loans market. To understand if we should enter the market, we must understand the general home loans trends occurring, and the reasons behind them.
+
+I **hypothesize that it is not currently a great time to enter the home loan market** (in 2014), since during this time period, the home loan market shrunk significantly.
+
+###General Trends in Proposed Market
+
+```{r decline}
+#Look at all loans, by year and loan purpose
+dt.year.trend <- dt.loans[,list(loan.sum.usd.billions = sum(loan.usd)/1e9), 
+                                          by = list(year,loan.purpose.desc)]
+
+#Reshape this data so we can sum up the total
+dt.year.trend.cast <- data.table(dcast(dt.year.trend, year ~ loan.purpose.desc, value.var = "loan.sum.usd.billions"))
+dt.year.trend.cast <- dt.year.trend.cast[,Total := `Purchase` + `Refinance`]
+dt.year.trend <- data.table::melt(dt.year.trend.cast, id.vars = "year", variable.name = "loan.purpose.desc", value.name = "loan.sum.usd.billions")
+
+#Pick some numbers to use in the writeup
+num.refinance.sum.2012 = dt.year.trend.cast[year == 2012, Refinance]
+num.refinance.sum.2014 = dt.year.trend.cast[year == 2014, Refinance]
+num.purchase.sum.2012 = dt.year.trend.cast[year == 2012, Purchase]
+num.purchase.sum.2014 = dt.year.trend.cast[year == 2014, Purchase]
+```
+
+Between 2012 and 2014, total loans dropped significantly, going from `r format(num.refinance.sum.2012 + num.purchase.sum.2012, digits = 1)` to `r format(num.refinance.sum.2014 + num.purchase.sum.2014, digits = 1)` billion USD as our hypothesis assumed. However, that trend differed greatly by loan type. **Figure 2** shows that while refinancing loans changed by `r  format((num.refinance.sum.2014 - num.refinance.sum.2012) * 100 / num.refinance.sum.2012, digits = 0)`%, house purchase loans actually increased by `r format((num.purchase.sum.2014 - num.purchase.sum.2012) * 100 / num.purchase.sum.2012, digits = 0)`%.  This shows that **our hypothesis is not correct**; although the home loan market is shrinking, home purchasing loans are rising, and may represent a good opportunity. By 2014, more loans were being given for purchasing than for refinancing, which means home purchase loans is currently a more desirable product to pursue.
+
+```{r declinefigure}
+#Line plot will illustrate the trend both generally and by loan purpose
+ggplot(data=dt.year.trend, aes(x = year, y = loan.sum.usd.billions, color = loan.purpose.desc))+
+  geom_line()+ geom_point(size = 2) +
+  labs(x = "Year",
+       y = "Total Loans (Billions)",
+       title = "Figure 2. Total Loans by Year")+ theme(text = element_text(size=14), axis.text.x = element_text(angle=90)) + scale_color_discrete(name="Loan Type") + scale_x_continuous(breaks = c(2012:2014)) + scale_y_continuous(limits = c(0, 170))
+```
+
+###Market Size by State
+
+Next, let's look at the trend by state. *Figure 3* shows the same trends apply across all states, with the total home loan market shrinking, but the purchase home loan market increasing. We also see that **the largest markets by far are VA and MD**. In fact, they dwarf the other markets, making up about 85% of the total market. This suggests that, as a new market entrant, we should **focus on just these two states** to maximize our access to the overall market while minimizing the regulatory costs associated with expanding to a different state.
+
+```{r statetrends}
+dt.state.trend <- dt.loans[,list(loan.sum.usd.billions = sum(loan.usd)/1e9), 
+                                          by = list(year,loan.purpose.desc, state.short)]
+
+
+#Reshape this data so we can sum up the total
+dt.state.trend.cast <- data.table(dcast(dt.state.trend, year + state.short ~ loan.purpose.desc, value.var = "loan.sum.usd.billions"))
+dt.state.trend.cast <- dt.state.trend.cast[,Total := `Purchase` + `Refinance`]
+dt.state.trend <- data.table::melt(dt.state.trend.cast, id.vars = c("year", "state.short"), variable.name = "loan.purpose.desc", value.name = "loan.sum.usd.billions")
+
+ggplot(data=dt.state.trend, aes(x = year, y = loan.sum.usd.billions, color = loan.purpose.desc))+
+  geom_line()+ geom_point(size = 2) +
+  labs(x = "Year",
+       y = "Total Loans (Billions)",
+       title = "Figure 3. Total Loans by State and Year")+ theme(text = element_text(size=14), axis.text.x = element_text(angle=90)) + scale_color_discrete(name="Loan Type") + scale_x_continuous(breaks = c(2012:2014)) + scale_y_continuous(limits = c(0, 90)) + facet_grid(~state.short)
+```
+
+
+###Establishing a General Trend
+
+To understand this trend, we can begin by investigating if the trend can be attributed to a general factor, such as the economy or national interest rates, versus a local factor, like a change in regional real estate value or a home loan company changing their lending standards. I will proceed to show **the trend is in fact uncorrelated with any particular geographic location or loan company**. 
+
+####Metropolitan Area
+While we've shown the trend is consistent across different states, we can look with even finer resolution at different metropolitan areas, characterized in this dataset as Metropolitan Statistical Areas/Metropolitan Divisions (MSA/MD). Looking at the metropolitan areas with the top 7 highest total home loan amounts, we see in **Figure 4** that the total loans percent changes are clustered near similar values regardless of metropolitan area. This shows the **trend is not due to regional effects near a particular city**.
+
+```{r msamd}
+#Get total loans by Metropolitan Statistical Area/Metropolitan Division
+dt.total.msamd =  dt.loans[,list(total = sum(loan.usd)), 
+                                            by = list(year, MSA.MD, loan.purpose.desc)][order(total, decreasing = TRUE)]
+
+#Get top 7 MSA.MDs
+int.msamd.top <- unique(dt.total.msamd[,list(n = .N), by = list(MSA.MD, loan.purpose.desc)][n == 3 & !is.na(MSA.MD)]$MSA.MD)[1:7]
+dt.total.msamd.top <- dt.total.msamd[MSA.MD %in% int.msamd.top]
+
+#Look at percent change in loans by year
+dt.total.msamd.top.2013 <- merge(dt.total.msamd.top[year == 2012], 
+                                 dt.total.msamd.top[year == 2013], 
+                                 by = c('MSA.MD', 'loan.purpose.desc'))[,pct_change := 100 * total.y / total.x]
+dt.total.msamd.top.2014 <- merge(dt.total.msamd.top[year == 2013], 
+                                 dt.total.msamd.top[year == 2014], 
+                                 by = c('MSA.MD', 'loan.purpose.desc'))[,pct_change := 100 * total.y / total.x]
+
+dt.total.msamd.top <- rbind(dt.total.msamd.top.2013, dt.total.msamd.top.2014)[,list(MSA.MD = MSA.MD, year = year.y, pct_change, loan.purpose.desc)]
+```
+
+``````{r msamdfigure, fig.height=8}
+#A point plot will best show the trend: all metroplitan areas had similar changes in total loans
+ggplot(data=dt.map.msamd[dt.total.msamd.top], aes(x = as.character(year), y = pct_change, color = MSA.MD.desc, group = MSA.MD))+
+  geom_point() + 
+  labs(x = "Year)",
+       y = "% Change in Total Loan From Previous Year",
+       title = "Figure 4. % Total Loan Changes by MSA/MD")+ theme(legend.position="bottom", legend.direction="vertical", text = element_text(size=14), axis.text.x = element_text(angle=90)) + facet_wrap(~loan.purpose.desc)+ scale_color_discrete(name="Metropolitan Area")
+```
+
+
+####Respondent
+Next, we look at the change in loan amounts by loan company. It is possible that a change in lending behavior at a major loan company could be driving the trend. Looking at the respondents with the top 10 highest total home loan amounts, we see in **Figure 5** that there is **no single company exerting a major influence on the trend**. We are now confident that **the observed trend is general**, and is not being biased by factors in a particular region or by any particular loan company.
+
+```{r respondent}
+#Get total loans by respondent
+dt.total.respondent =  dt.loans[,list(total = sum(loan.usd)), 
+                                                 by = list(year, respondent.name, loan.purpose.desc)][order(total, decreasing = TRUE)]
+
+#Get top 7 MSA.MDs
+chr.respondent.top <- unique(dt.total.respondent[,list(n = .N), by = list(respondent.name, loan.purpose.desc)][n == 3 & !is.na(respondent.name)]$respondent.name)[1:10]
+dt.total.respondent.top <- dt.total.respondent[respondent.name %in% chr.respondent.top]
+
+#Look at percent change in loans by year
+dt.total.respondent.top.2013 <- merge(dt.total.respondent.top[year == 2012], 
+                                      dt.total.respondent.top[year == 2013], 
+                                      by = c('respondent.name', 'loan.purpose.desc'))[,pct_change := 100 * total.y / total.x]
+dt.total.respondent.top.2014 <- merge(dt.total.respondent.top[year == 2013], 
+                                      dt.total.respondent.top[year == 2014], 
+                                      by = c('respondent.name', 'loan.purpose.desc'))[,pct_change := 100 * total.y / total.x]
+
+dt.total.respondent.top <- rbind(dt.total.respondent.top.2013,dt.total.respondent.top.2013)[,list(respondent.name, year = year.y, pct_change, loan.purpose.desc)]
+```
+
+
+```{r respondentfigure, fig.height=8}
+#A dot plot will best show the trend: all metroplitan areas had similar changes in total loans
+ggplot(data=dt.total.respondent.top, aes(x = as.character(year), y = pct_change, color = respondent.name))+
+  geom_point() + 
+  labs(x = "Year)",
+       y = "% Change in Total Loan From Previous Year",
+       title = "Figure 5. % Total Loan Changes by Company")+ theme(legend.position="bottom", legend.direction="vertical", text = element_text(size=14), axis.text.x = element_text(angle=90)) + facet_wrap(~loan.purpose.desc)+ scale_color_discrete(name="Metropolitan Area")
+```
+
+###Lending Changes
+
+We've shown the change in home loans were not limited by geographic area nor loan company. General, nationwide factors were responsible for the trend.
+
+A fall in mortgage interest rates could explain the drop in refinancing. Home purchasing is more complicated, as it is largely driven by real estate prices, which is affected by more factors than the mortgage rate. That is largely outside of the scope of our dataset, but there is still interesting information we can extract from our data.
+
+In the next sections, we'll look at some interesting trends which suggest **the fall in refinancing is in fact likely due to mortgage interest rates**, while the rise in home purchasing is likely due to a combination of a **change in lending standards** and **opportunistic buyers responding to lower home prices**.
+
+####Rise in Conventional Loans
+One possible explanation for a rise in purchasing loans would be loosened lending standards. As a proxy for lending standard, we can look at the ratio of conventional to non-conventional loans. 
+
+Home loans are made by private lenders, but can be backed by government agencies (non-conventional loan). These agencies, such as the Federal Housing Administration or Department of Veteran Affairs, insure non-conventional loans, allowing applicants to receive home loans who would not otherwise qualify. By contrast, conventional home loans are not backed by any government agency, and are typically characterized by stricter lending standards. A **rise in the proportion of conventional loans for equally qualified applicants therefore would indicate a loosening of lending standards**.
+
+We see in **Figure 6** that while non-conventional home purchase loans stayed at similar levels throughout the three year period, conventional purchase loans increased. This shows that either **lending standards loosened for home purchase loans, or the number of highly qualified applicants increased**. We will investigate this further in the next section by looking only at low income individuals.
+
+By contrast, refinancing loans fell in equal proportions, whether conventional or non-conventional. This shows **the fall in refinancing loans was driven by fewer people seeking refinancing loans** as opposed to a change in refinancing loan lending standards, supporting the idea that a drop in interest rates drove this change.
+
+Note that we also looked at **conforming versus jumbo** loans, but did not find any obvious strong trends, so it is not included in this report. This is worth further investigation.
+
+```{r conventional}
+dt.conventional =  dt.loans[,list(total = sum(loan.usd)/1e9), 
+                                             by = list(year, status.conventional, loan.purpose.desc)][order(total, decreasing = TRUE)]
+
+ggplot(data=dt.conventional, aes(x = year, y = total, color = status.conventional))+
+  geom_line()+ geom_point() +
+labs(x = "Year",
+y = "Total Loan Amount (Billions)",
+title = "Fig 6. Proportion of Purchase Conventional Loans Increased")+ theme(legend.position="bottom", text = element_text(size=14)) + facet_wrap(~loan.purpose.desc) + scale_color_discrete(name="Conventional Status")+ scale_x_continuous(breaks = c(2012:2014))
+
+```
+
+####Rise in Conventional Loans for Low-Income Individuals
+To determine whether lending standards loosened or the increase in conventional purchase loans was simply due to an increase in highly qualified applicants, we can look at total loans given to less qualified, low income individuals. We'll define low median income as being under 50k, though this threshold may be changed in the interactive plot below. We see in **Figure 7** that even among only low income indivudals, there was a shift from non-conventional to conventional loans. This confirms that **lending standards for home purchase loans loosened from 2012 to 2014**, partly explaining the increase in home purchase loans.
+
+```{r lowincome}
+#Interactive plot that allows threshold for low income to be changed
+inputPanel(
+sliderInput("low.income.threshold", label = "Low Income Threshold",
+min = 10000, max = 150000, value = 50000, step = 10000)
+)
+
+renderPlot({
+dt.conventional.low.income =  dt.loans[applicant.income.usd < input$low.income.threshold & loan.purpose.desc == 'Purchase',list(total = sum(loan.usd)/1e9),  by = list(year, status.conventional)][order(total, decreasing = TRUE)]
+
+ggplot(data=dt.conventional.low.income, aes(x = year, y = total, color = status.conventional))+
+  geom_line()+geom_point() + labs(x = "Year", y = "Total Loan Amount (Billions)",
+title = "Figure 7. Low Income Purchase Loans")+ theme(text = element_text(size=14)) + scale_color_discrete(name="Conventional Status")+ scale_x_continuous(breaks = c(2012:2014))
+}, width = 600)
+```
+
+####Median Income Trends
+
+There is more to the story that is revealed by looking at the reported median income of loan applicants. We can see in **Figure 8** that **high income individuals are disproportionately driving the change in home loans**. Note that since higher income individuals tend to receive larger loans, I chose to look at quantity of loans instead of total loan amount, which would otherwise have been a confounding factor in our data.
+
+One plausible explanation is that high income indivuals are **more likely to take advantage of a fall in home prices by purchasing cheap real estate**. Additionally, the data shows these high income individuals are more likely than low income individuals to respond to changes in mortage interest rates by refinancing, since they were also disproportionately responsible for the fall in refinancing loans during this time period.
+
+```{r medianincome}
+#Make an interactive shiny plot showing change in median income of successful loan applicants
+#Bar chart since we're using quantity
+inputPanel(
+sliderInput("n_breaks_income", label = "Number of bins:",
+min = 2, max = 10, value = 4, step = 1)
+)
+
+renderPlot({
+int.cuts = seq(from = 0, to = 120, length.out = as.integer(input$n_breaks_income))
+
+dt.income.v.loan = dt.loans[!is.na(applicant.income.usd),list(year =year, loan.purpose.desc, bucket = cut2(applicant.income.usd/1000, cuts = int.cuts))]
+dt.income.v.loan <- dt.income.v.loan[,list(count = .N), by = list(year, bucket, loan.purpose.desc)]
+dt.income.v.loan <- dt.income.v.loan[,count_normalized := count / sum(count), by = list(year, loan.purpose.desc)]
+
+ggplot(data=dt.income.v.loan, aes(x = bucket, y = count_normalized, fill = as.character(year))) +
+geom_bar(stat='identity', position = 'dodge') +
+labs(x = "Median Income (thousands)",
+y = "Percentage of Loans",
+title = "Figure 8. Median Income Disributions by Year")+ theme(text = element_text(size=14), axis.text.x = element_text(angle=0, vjust = 1, size = 9)) + scale_fill_discrete(name="Year")  +
+facet_wrap( ~ loan.purpose.desc)
+})
+```
+
+###Data Narrative: Summary of Key Insights
+Based on our data, we saw two major trends from 2012 to 2014. Refinancing loans fell, while purchasing loans rose. These trends occurred nationwide and were not limited to any particular area or lending company. 
+
+Refinancing loans did not decrease as a result of an increase in lending standards, suggesting they were instead driven by falling mortgage rates.
+
+On the other hand, the increase in purchasing loans were driven by two factors. First, a loosening of lending standards contributed to an increase in home purchasing loans, which we showed by looking at the increasing proportion of conventional loans being given to low income applicants. Second, higher income individuals took out greater amounts of home purchasing loans. The easiest explanation for this phenomenon is that real estate prices fell, leading these individuals to capitalize on cheap real estate in anticipation of the market rebounding.
+
+Based on these results, I **reject my initial hypothesis**. Despite the shrinking overall home loan market, **I recommend the following**:
+
+1. Our firm should **enter the home purchase loan product market**, which is increasing and now is a larger market than refinancing loans. Refinancing loans should be a lower priority unless we believe the mortgage rate will go up soon.
+2. Our firm should **focus on VA and MD**, which together make up over 85% of the total market.
+3. We can feel confident offering **conventional loans**, as the number of people seeking conventional loans is rising, and they make up the majority of all loans. 
+4. Finally, our peer institutions have loosened their lending criteria; we should **re-evaluate our own lending criteria** and make sure they are not overly conservative in order to remain competitive.
+
+##A Step Further: Data Exploration with a Shiny Tool
+  
+One problem I'd like to rectify is the lack of a way to more easily visualize home loan market trends for different customer profiles. This could be useful for future business needs, when we are trying to determine which cities and what kinds of customers we should be putting our limited resources into gaining market penetration for.
+  
+I have created a prototype interactive tool to simulate being a particular customer profile, and seeing from their point of view what the home loan market is like. This tool is meant to provide an easier way to get an intuitive feel on the home loan trends for different demographics. It provides a starting point for discovering a particular city or type of customer to target through our new loan product.
+  
+The tool graphically outputs the typical home loan profile for that particular demographic and also output some helpful information for the applicant, such as the typical dollar amounts of successful home loans for similar applicants, and how the home loan market will change for them from over this time period. Our firm would do best to target demographics where the home loan market is large and growing.
+  
+```{r shinyapp}
+LoanSimulationShiny(dt.loans)
+```
+

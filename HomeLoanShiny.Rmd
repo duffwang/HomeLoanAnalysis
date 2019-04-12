@@ -1,0 +1,35 @@
+---
+title: "ShinyHomeLoan"
+author: "Duff Wang"
+date: "4/11/2019"
+output: html_document
+runtime: shiny
+resource_files:
+- 2012_to_2014_loans_data_cached.rds
+- 2012_to_2014_institutions_data_cached.rds
+---
+
+```{r setup, include=FALSE}
+#Source HMDA analysis API and our shiny simulation tool
+source('HMDA_API.R')
+source('LoanSimulationShinyApp.R')
+
+#Parameters
+knitr::opts_chunk$set(echo = FALSE)   #Set this to TRUE to see analysis code in the report
+```
+
+```{r import}
+#Now, we import the raw data.
+#Read input data
+dt.loans <- hmda_init()
+```
+
+##Data Exploration with a Shiny Tool
+  
+In this interactive Shiny tool, we use the home loan data used in the previous two posts to simulate a particular customer profile. This gives us a view of the home loan market from the perspective of a particular demographic. This tool is meant to provide an easier way to get an intuitive feel on the home loan trends for different demographics. It provides a starting point for discovering a particular city or type of customer to target through our new loan product.
+  
+The tool graphically outputs the typical home loan profile for that particular demographic and also output some helpful information for the applicant, such as the typical dollar amounts of successful home loans for similar applicants, and how the home loan market will change for them from over this time period. Our firm would do best to target demographics where the home loan market is large and growing.
+
+```{r shinyapp}
+LoanSimulationShiny(dt.loans)
+```
